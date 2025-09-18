@@ -21,33 +21,93 @@ def extract_audio_info(url, format_preference='m4a'):
     """Extract audio download URL and metadata from YouTube video"""
     try:
         ydl_opts = {
-            'format': 'bestaudio/best',
+            'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best',
             'noplaylist': True,
-            'extractaudio': True,
-            'audioformat': format_preference,
-            'quiet': True,
-            'no_warnings': True,
+            'quiet': False,  # Enable logging to debug
+            'no_warnings': False,
+            'extract_flat': False,
+            'extractor_args': {
+                'youtube': {
+                    'skip': ['dash', 'hls'],
+                    'player_client': ['android', 'web']
+                }
+            },
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
         }
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            logger.info(f"Extracting info for URL: {url}")
             info = ydl.extract_info(url, download=False)
 
-            # Get the best audio format
+            # Debug: log all available formats
             formats = info.get('formats', [])
+            logger.info(f"Found {len(formats)} formats")
+
+            # Look specifically for audio streams
             audio_url = None
 
-            # Look for audio-only formats first
-            for fmt in formats:
-                if fmt.get('acodec') != 'none' and fmt.get('vcodec') == 'none':
-                    audio_url = fmt.get('url')
-                    break
+            # Method 1: Use yt-dlp's format selection
+            if 'url' in info:
+                audio_url = info['url']
+                logger.info(f"Found main URL: {audio_url}")
 
-            # If no audio-only format found, get best overall format
-            if not audio_url and formats:
-                audio_url = formats[-1].get('url')
+            # Method 2: Manual format selection if main URL is not good
+            if not audio_url or 'storyboard' in audio_url or 'jpg' in audio_url:
+                # Filter for audio-only formats
+                audio_formats = []
+                for fmt in formats:
+                    acodec = fmt.get('acodec', 'none')
+                    vcodec = fmt.get('vcodec', 'none')
+                    url_fmt = fmt.get('url', '')
+
+                    # Skip if it's a storyboard or image
+                    if 'storyboard' in url_fmt or '.jpg' in url_fmt or '.png' in url_fmt:
+                        continue
+
+                    # Audio-only formats (no video)
+                    if acodec != 'none' and vcodec == 'none':
+                        audio_formats.append(fmt)
+                        logger.info(f"Audio format found: {fmt.get('format_id')} - {acodec} - {fmt.get('abr')}kbps")
+
+                if audio_formats:
+                    # Sort by audio bitrate, prefer higher quality
+                    audio_formats.sort(key=lambda x: x.get('abr', 0) or 0, reverse=True)
+
+                    # Prefer m4a format if available
+                    m4a_formats = [f for f in audio_formats if f.get('ext') == 'm4a']
+                    if m4a_formats:
+                        audio_url = m4a_formats[0].get('url')
+                        logger.info(f"Selected m4a format: {m4a_formats[0].get('format_id')}")
+                    else:
+                        audio_url = audio_formats[0].get('url')
+                        logger.info(f"Selected best audio format: {audio_formats[0].get('format_id')}")
+
+            # Method 3: Fallback to any format with audio
+            if not audio_url or 'storyboard' in audio_url or 'jpg' in audio_url:
+                logger.warning("No pure audio format found, looking for mixed formats...")
+                for fmt in formats:
+                    url_fmt = fmt.get('url', '')
+                    acodec = fmt.get('acodec', 'none')
+
+                    # Skip storyboards and images
+                    if 'storyboard' in url_fmt or '.jpg' in url_fmt or '.png' in url_fmt:
+                        continue
+
+                    if acodec != 'none':
+                        audio_url = url_fmt
+                        logger.info(f"Selected mixed format: {fmt.get('format_id')}")
+                        break
 
             if not audio_url:
-                audio_url = info.get('url')
+                raise Exception("No valid audio stream found")
+
+            # Validate the URL doesn't contain image extensions
+            if 'storyboard' in audio_url or '.jpg' in audio_url or '.png' in audio_url:
+                raise Exception("Only storyboard/image URLs found, no audio streams available")
+
+            logger.info(f"Final audio URL: {audio_url[:100]}...")
 
             return {
                 'audio_url': audio_url,
