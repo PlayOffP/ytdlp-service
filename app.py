@@ -451,6 +451,12 @@ def compress_segment_for_whisper(segment_info, output_file):
 def compress_audio_for_whisper(input_file, output_file, original_size_mb):
     """Compress audio file to be under 25MB for OpenAI Whisper with Railway-optimized speed"""
     try:
+        # Early validation: don't compress files already under 25MB
+        if original_size_mb < 25:
+            logger.info(f"File already under 25MB ({original_size_mb:.2f}MB), no compression needed")
+            # Copy file without compression
+            shutil.copy2(input_file, output_file)
+            return os.path.getsize(output_file)
         # Ultra-aggressive settings optimized for Railway's 600s timeout
         if original_size_mb > 300:
             # Extreme files: immediate ultra-low quality
@@ -651,13 +657,14 @@ def process_audio():
 
         # Process audio for Whisper with segmentation for large files
         try:
-            # Decide processing strategy based on file size
-            if original_size_mb <= 20:
-                # Small files: direct compression
-                logger.info(f"Small file ({original_size_mb:.1f}MB), using direct compression")
-                compressed_size = compress_audio_for_whisper(input_file, output_file, original_size_mb)
-                compressed_size_mb = compressed_size / (1024*1024)
-                logger.info(f"Direct compression: {original_size_mb:.1f}MB → {compressed_size_mb:.2f}MB")
+            # Check if original file is already under 25MB - skip compression entirely
+            if original_size_mb < 25:
+                logger.info(f"File already under 25MB ({original_size_mb:.2f}MB), skipping compression")
+                # Copy original file to output file for consistent response handling
+                shutil.copy2(input_file, output_file)
+                compressed_size = original_size
+                compressed_size_mb = original_size_mb
+                logger.info(f"No compression needed: {original_size_mb:.2f}MB file passed through")
 
             elif original_size_mb <= 100:
                 # Medium files: aggressive compression
@@ -697,22 +704,34 @@ def process_audio():
             # Provide helpful error messages based on the failure type
             if "timed out" in error_msg.lower():
                 return jsonify({
-                    'error': f'Audio file too large to process within time limits. Original size: {original_size_mb:.1f}MB. Try a shorter video.',
+                    'error': f'Audio compression timed out. Original file size: {original_size_mb:.2f}MB. Try a shorter video.',
                     'success': False,
+                    'original_size_mb': original_size_mb,
                     'suggestion': 'Use videos under 200MB for faster processing'
                 }), 408  # Request Timeout
 
             elif "too large" in error_msg.lower():
-                return jsonify({
-                    'error': f'Compressed audio still exceeds 25MB limit. Original: {original_size_mb:.1f}MB',
-                    'success': False,
-                    'suggestion': 'Use shorter videos for Whisper transcription'
-                }), 413  # Payload Too Large
+                # Only show this error if we actually attempted compression (file was >25MB)
+                if original_size_mb >= 25:
+                    return jsonify({
+                        'error': f'Compressed audio still exceeds 25MB limit after compression. Original: {original_size_mb:.2f}MB',
+                        'success': False,
+                        'original_size_mb': original_size_mb,
+                        'suggestion': 'Use shorter videos for Whisper transcription'
+                    }), 413  # Payload Too Large
+                else:
+                    # This shouldn't happen with our new logic, but handle gracefully
+                    return jsonify({
+                        'error': f'Unexpected compression error for small file ({original_size_mb:.2f}MB): {error_msg}',
+                        'success': False,
+                        'original_size_mb': original_size_mb
+                    }), 500
 
             else:
                 return jsonify({
-                    'error': f'Audio compression failed: {error_msg}',
-                    'success': False
+                    'error': f'Audio processing failed: {error_msg}. Original file size: {original_size_mb:.2f}MB',
+                    'success': False,
+                    'original_size_mb': original_size_mb
                 }), 500
 
         # Stream the compressed audio file
