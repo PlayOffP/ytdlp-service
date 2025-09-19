@@ -304,60 +304,118 @@ def download_audio():
             'success': False
         }), 500
 
-def compress_audio_for_whisper(input_file, output_file):
-    """Compress audio file to be under 25MB for OpenAI Whisper"""
+def compress_audio_for_whisper(input_file, output_file, original_size_mb):
+    """Compress audio file to be under 25MB for OpenAI Whisper with Railway-optimized speed"""
     try:
-        # Whisper-optimized settings: 64kbps bitrate, m4a format
+        # Ultra-aggressive settings optimized for Railway's 600s timeout
+        if original_size_mb > 300:
+            # Extreme files: immediate ultra-low quality
+            bitrate = '12k'
+            sample_rate = '8000'
+            timeout = 90  # Very short timeout
+        elif original_size_mb > 200:
+            # Very large files: aggressive compression
+            bitrate = '16k'
+            sample_rate = '8000'
+            timeout = 120
+        elif original_size_mb > 100:
+            # Large files: fast compression
+            bitrate = '24k'
+            sample_rate = '11025'
+            timeout = 150
+        else:
+            # Smaller files: still fast but better quality
+            bitrate = '32k'
+            sample_rate = '16000'
+            timeout = 120
+
+        logger.info(f"Railway-optimized compression: {bitrate} bitrate, {sample_rate}Hz for {original_size_mb:.1f}MB file")
+
+        # Railway-optimized FFmpeg command with maximum speed
         cmd = [
             'ffmpeg',
             '-i', input_file,
-            '-c:a', 'aac',           # AAC codec for m4a
-            '-b:a', '64k',           # 64kbps bitrate for Whisper
-            '-ac', '1',              # Mono channel (reduces size)
-            '-ar', '16000',          # 16kHz sample rate (Whisper's preference)
-            '-movflags', '+faststart', # Optimize for streaming
-            '-y',                    # Overwrite output file
+            '-c:a', 'aac',               # AAC codec (fastest)
+            '-b:a', bitrate,             # Ultra-low bitrate
+            '-ac', '1',                  # Mono (cuts size in half)
+            '-ar', sample_rate,          # Low sample rate for speed
+            '-threads', '2',             # Match Railway worker cores
+            '-preset', 'ultrafast',      # Fastest preset always
+            '-profile:a', 'aac_low',     # Low complexity profile
+            '-avoid_negative_ts', 'make_zero',
+            '-shortest',                 # Stop at shortest stream
+            '-map_metadata', '-1',       # Strip all metadata
+            '-movflags', '+faststart',   # Quick header
+            '-f', 'mp4',                 # Force container
+            '-y',                        # Overwrite
             output_file
         ]
 
-        logger.info(f"Compressing audio with command: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        logger.info(f"Railway compression command: {' '.join(cmd[:8])}...")  # Log truncated command
+
+        # Run with strict timeout
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+        )
 
         if result.returncode != 0:
-            raise Exception(f"FFmpeg error: {result.stderr}")
+            # Emergency fallback: absolute minimum quality for Railway
+            logger.warning(f"Primary compression failed: {result.stderr[:200]}...")
+            logger.info("Trying emergency Railway-survival mode...")
 
-        # Check file size
-        file_size = os.path.getsize(output_file)
-        logger.info(f"Compressed audio file size: {file_size / (1024*1024):.2f} MB")
-
-        if file_size > 24 * 1024 * 1024:  # 24MB to be safe
-            logger.warning(f"File still too large ({file_size / (1024*1024):.2f} MB), trying more aggressive compression")
-
-            # More aggressive compression
-            cmd_aggressive = [
+            cmd_emergency = [
                 'ffmpeg',
                 '-i', input_file,
                 '-c:a', 'aac',
-                '-b:a', '32k',           # Lower bitrate
+                '-b:a', '8k',            # Absolute minimum
                 '-ac', '1',              # Mono
-                '-ar', '16000',          # 16kHz
-                '-movflags', '+faststart',
+                '-ar', '8000',           # Lowest sample rate
+                '-threads', '1',         # Single thread for stability
+                '-preset', 'ultrafast',
+                '-profile:a', 'aac_low',
+                '-t', '600',             # Limit to 10 minutes max
+                '-map_metadata', '-1',
+                '-f', 'mp4',
                 '-y',
                 output_file
             ]
 
-            result = subprocess.run(cmd_aggressive, capture_output=True, text=True, timeout=300)
-            if result.returncode != 0:
-                raise Exception(f"FFmpeg aggressive compression error: {result.stderr}")
+            result = subprocess.run(
+                cmd_emergency,
+                capture_output=True,
+                text=True,
+                timeout=45,  # Ultra-short emergency timeout
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+            )
 
-            file_size = os.path.getsize(output_file)
-            logger.info(f"Aggressively compressed audio file size: {file_size / (1024*1024):.2f} MB")
+            if result.returncode != 0:
+                raise Exception(f"Emergency Railway compression failed: {result.stderr}")
+
+            logger.info("Emergency Railway compression succeeded")
+
+        # Check final file size
+        file_size = os.path.getsize(output_file)
+        file_size_mb = file_size / (1024*1024)
+
+        logger.info(f"Compressed {original_size_mb:.1f}MB → {file_size_mb:.2f}MB")
+
+        # Validate size limit
+        if file_size > 25 * 1024 * 1024:
+            raise Exception(f"File still too large: {file_size_mb:.2f}MB (max 25MB)")
 
         return file_size
 
     except subprocess.TimeoutExpired:
-        raise Exception("Audio compression timed out")
+        logger.error(f"Compression timed out after {timeout}s")
+        raise Exception(f"Audio compression timed out after {timeout} seconds. File too large for processing.")
+    except FileNotFoundError:
+        raise Exception("FFmpeg not found. Please ensure FFmpeg is installed.")
     except Exception as e:
+        logger.error(f"Compression error: {str(e)}")
         raise Exception(f"Audio compression failed: {str(e)}")
 
 @app.route('/process', methods=['GET'])
@@ -428,7 +486,17 @@ def process_audio():
                             f.write(chunk)
                             original_size += len(chunk)
 
-                logger.info(f"Downloaded {original_size / (1024*1024):.2f} MB original audio")
+                original_size_mb = original_size / (1024*1024)
+                logger.info(f"Downloaded {original_size_mb:.2f} MB original audio")
+
+                # Railway safety check: reject extremely large files upfront
+                if original_size_mb > 500:
+                    logger.warning(f"File too large for Railway processing: {original_size_mb:.1f}MB")
+                    return jsonify({
+                        'error': f'File too large for processing: {original_size_mb:.1f}MB (max 500MB)',
+                        'success': False,
+                        'suggestion': 'Use shorter videos or lower quality audio for Whisper'
+                    }), 413  # Payload Too Large
 
         except Exception as e:
             logger.error(f"Failed to download audio: {str(e)}")
@@ -437,24 +505,44 @@ def process_audio():
                 'success': False
             }), 500
 
-        # Compress audio for Whisper
+        # Compress audio for Whisper with Railway-optimized settings
         try:
-            compressed_size = compress_audio_for_whisper(input_file, output_file)
 
-            if compressed_size > 25 * 1024 * 1024:
-                return jsonify({
-                    'error': f'Audio file too large for Whisper: {compressed_size / (1024*1024):.2f} MB (max 25MB)',
-                    'success': False
-                }), 413
+            # Check if file is already small enough
+            if original_size_mb <= 20:  # Under 20MB, minimal compression needed
+                logger.info(f"File already small ({original_size_mb:.1f}MB), using light compression")
+                compressed_size = compress_audio_for_whisper(input_file, output_file, original_size_mb)
+            else:
+                logger.info(f"Large file ({original_size_mb:.1f}MB), using aggressive compression")
+                compressed_size = compress_audio_for_whisper(input_file, output_file, original_size_mb)
 
-            logger.info(f"Successfully compressed audio to {compressed_size / (1024*1024):.2f} MB for Whisper")
+            compressed_size_mb = compressed_size / (1024*1024)
+            logger.info(f"Compression complete: {original_size_mb:.1f}MB → {compressed_size_mb:.2f}MB")
 
         except Exception as e:
-            logger.error(f"Failed to compress audio: {str(e)}")
-            return jsonify({
-                'error': f'Failed to compress audio: {str(e)}',
-                'success': False
-            }), 500
+            error_msg = str(e)
+            logger.error(f"Compression failed: {error_msg}")
+
+            # Provide helpful error messages based on the failure type
+            if "timed out" in error_msg.lower():
+                return jsonify({
+                    'error': f'Audio file too large to process within time limits. Original size: {original_size_mb:.1f}MB. Try a shorter video.',
+                    'success': False,
+                    'suggestion': 'Use videos under 200MB for faster processing'
+                }), 408  # Request Timeout
+
+            elif "too large" in error_msg.lower():
+                return jsonify({
+                    'error': f'Compressed audio still exceeds 25MB limit. Original: {original_size_mb:.1f}MB',
+                    'success': False,
+                    'suggestion': 'Use shorter videos for Whisper transcription'
+                }), 413  # Payload Too Large
+
+            else:
+                return jsonify({
+                    'error': f'Audio compression failed: {error_msg}',
+                    'success': False
+                }), 500
 
         # Stream the compressed audio file
         def generate_compressed_stream():
