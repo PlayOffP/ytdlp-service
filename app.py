@@ -1,8 +1,10 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 import yt_dlp
 import os
 import logging
+import requests
+import io
 from urllib.parse import urlparse
 
 app = Flask(__name__)
@@ -163,7 +165,11 @@ def health_check():
     return jsonify({
         'status': 'healthy',
         'service': 'yt-dlp audio extraction service',
-        'version': '1.0.0'
+        'version': '2.0.0',
+        'endpoints': {
+            '/extract': 'Extract audio URL from YouTube video',
+            '/download': 'Download audio file server-side and stream to client (bypasses 403 errors)'
+        }
     })
 
 @app.route('/extract', methods=['GET'])
@@ -198,6 +204,97 @@ def extract_audio():
 
     except Exception as e:
         logger.error(f"Unexpected error in /extract endpoint: {str(e)}")
+        return jsonify({
+            'error': f'Internal server error: {str(e)}',
+            'success': False
+        }), 500
+
+@app.route('/download', methods=['GET'])
+def download_audio():
+    """Download audio file server-side and stream it back to bypass YouTube detection"""
+    try:
+        # Get URL parameter
+        url = request.args.get('url')
+        if not url:
+            return jsonify({
+                'error': 'Missing required parameter: url',
+                'success': False
+            }), 400
+
+        # Get format parameter (default to m4a)
+        format_preference = request.args.get('format', 'm4a')
+
+        # Validate YouTube URL
+        if not is_valid_youtube_url(url):
+            return jsonify({
+                'error': 'Invalid YouTube URL provided',
+                'success': False
+            }), 400
+
+        # First, extract the audio URL
+        extract_result = extract_audio_info(url, format_preference)
+
+        if not extract_result.get('success'):
+            return jsonify(extract_result), 500
+
+        audio_url = extract_result['audio_url']
+        title = extract_result.get('title', 'audio')
+
+        # Sanitize filename
+        safe_title = "".join(c for c in title if c.isalnum() or c in (' ', '-', '_', '.')).rstrip()
+        if not safe_title:
+            safe_title = "audio"
+
+        filename = f"{safe_title}.{format_preference}"
+
+        logger.info(f"Downloading audio from: {audio_url[:100]}...")
+
+        # Enhanced headers for downloading from YouTube
+        download_headers = {
+            'User-Agent': 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.210 Mobile Safari/537.36',
+            'Accept': '*/*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'identity',  # Disable compression for streaming
+            'Connection': 'keep-alive',
+            'Referer': 'https://www.youtube.com/',
+            'Origin': 'https://www.youtube.com',
+            'Sec-Fetch-Dest': 'video',
+            'Sec-Fetch-Mode': 'no-cors',
+            'Sec-Fetch-Site': 'cross-site',
+            'Range': 'bytes=0-',  # Request range to enable streaming
+        }
+
+        # Stream the audio file from YouTube to the client
+        def generate():
+            try:
+                with requests.get(audio_url, headers=download_headers, stream=True, timeout=30) as r:
+                    r.raise_for_status()
+                    for chunk in r.iter_content(chunk_size=8192):
+                        if chunk:
+                            yield chunk
+            except Exception as e:
+                logger.error(f"Error streaming audio: {str(e)}")
+                yield b''  # End stream on error
+
+        # Determine content type
+        content_type = 'audio/mp4' if format_preference == 'm4a' else 'audio/webm'
+
+        # Return streaming response
+        response = Response(
+            stream_with_context(generate()),
+            content_type=content_type,
+            headers={
+                'Content-Disposition': f'attachment; filename="{filename}"',
+                'Cache-Control': 'no-cache',
+                'X-Content-Type-Options': 'nosniff',
+                'Accept-Ranges': 'bytes',
+            }
+        )
+
+        return response
+
+    except Exception as e:
+        logger.error(f"Unexpected error in /download endpoint: {str(e)}")
         return jsonify({
             'error': f'Internal server error: {str(e)}',
             'success': False
