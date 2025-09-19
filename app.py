@@ -168,7 +168,8 @@ def health_check():
         'version': '2.0.0',
         'endpoints': {
             '/extract': 'Extract audio URL from YouTube video',
-            '/download': 'Download audio file server-side and stream to client (bypasses 403 errors)'
+            '/download': 'Download audio file server-side and stream to client (bypasses 403 errors)',
+            '/process': 'Complete pipeline: extract + download audio as binary stream (optimized for n8n)'
         }
     })
 
@@ -295,6 +296,120 @@ def download_audio():
 
     except Exception as e:
         logger.error(f"Unexpected error in /download endpoint: {str(e)}")
+        return jsonify({
+            'error': f'Internal server error: {str(e)}',
+            'success': False
+        }), 500
+
+@app.route('/process', methods=['GET'])
+def process_audio():
+    """Complete pipeline: extract YouTube audio and stream binary directly (optimized for n8n)"""
+    try:
+        # Get URL parameter
+        url = request.args.get('url')
+        if not url:
+            return jsonify({
+                'error': 'Missing required parameter: url',
+                'success': False
+            }), 400
+
+        # Validate YouTube URL
+        if not is_valid_youtube_url(url):
+            return jsonify({
+                'error': 'Invalid YouTube URL provided',
+                'success': False
+            }), 400
+
+        logger.info(f"Processing audio for URL: {url}")
+
+        # Extract audio information using optimized format selection
+        try:
+            extract_result = extract_audio_info(url, 'm4a')
+            if not extract_result.get('success'):
+                return jsonify(extract_result), 500
+
+            audio_url = extract_result['audio_url']
+            title = extract_result.get('title', 'audio')
+
+            logger.info(f"Successfully extracted audio URL, now streaming...")
+
+        except Exception as e:
+            logger.error(f"Failed to extract audio info: {str(e)}")
+            return jsonify({
+                'error': f'Failed to extract audio: {str(e)}',
+                'success': False
+            }), 500
+
+        # Enhanced headers optimized for YouTube streaming
+        stream_headers = {
+            'User-Agent': 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.210 Mobile Safari/537.36',
+            'Accept': '*/*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'identity',
+            'Connection': 'keep-alive',
+            'Referer': 'https://www.youtube.com/',
+            'Origin': 'https://www.youtube.com',
+            'Sec-Fetch-Dest': 'video',
+            'Sec-Fetch-Mode': 'no-cors',
+            'Sec-Fetch-Site': 'cross-site',
+            'DNT': '1',
+            'Sec-GPC': '1',
+        }
+
+        # Stream the audio with optimized chunking
+        def generate_audio_stream():
+            try:
+                logger.info(f"Starting audio stream from: {audio_url[:100]}...")
+                with requests.get(
+                    audio_url,
+                    headers=stream_headers,
+                    stream=True,
+                    timeout=60,
+                    verify=True
+                ) as response:
+                    response.raise_for_status()
+
+                    # Log successful connection
+                    content_length = response.headers.get('content-length', 'unknown')
+                    logger.info(f"Connected to audio stream. Content-Length: {content_length}")
+
+                    # Stream in optimized chunks
+                    chunk_size = 16384  # 16KB chunks for better performance
+                    bytes_streamed = 0
+
+                    for chunk in response.iter_content(chunk_size=chunk_size):
+                        if chunk:
+                            bytes_streamed += len(chunk)
+                            yield chunk
+
+                    logger.info(f"Successfully streamed {bytes_streamed} bytes")
+
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Request error during streaming: {str(e)}")
+                yield b''  # End stream gracefully
+            except Exception as e:
+                logger.error(f"Unexpected error during streaming: {str(e)}")
+                yield b''  # End stream gracefully
+
+        # Create optimized streaming response
+        response = Response(
+            stream_with_context(generate_audio_stream()),
+            content_type='audio/mp4',  # Standard MIME type for m4a
+            headers={
+                'Cache-Control': 'no-cache, no-store, must-revalidate',
+                'Pragma': 'no-cache',
+                'Expires': '0',
+                'X-Content-Type-Options': 'nosniff',
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Methods': 'GET',
+                'Access-Control-Allow-Headers': 'Content-Type',
+            }
+        )
+
+        return response
+
+    except Exception as e:
+        logger.error(f"Unexpected error in /process endpoint: {str(e)}")
         return jsonify({
             'error': f'Internal server error: {str(e)}',
             'success': False
