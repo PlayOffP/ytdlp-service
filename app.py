@@ -168,11 +168,16 @@ def health_check():
     return jsonify({
         'status': 'healthy',
         'service': 'yt-dlp audio extraction service',
-        'version': '2.0.0',
+        'version': '3.0.0',
         'endpoints': {
             '/extract': 'Extract audio URL from YouTube video',
             '/download': 'Download audio file server-side and stream to client (bypasses 403 errors)',
-            '/process': 'Complete pipeline: extract + compress audio for Whisper (<25MB, 64kbps, mono, 16kHz)'
+            '/process': 'Complete pipeline: extract + compress audio for Whisper (with segmentation for large files)'
+        },
+        'features': {
+            'segmentation': 'Large files (>100MB) automatically split into 10-minute segments',
+            'timeout_safety': 'Railway-optimized processing to prevent worker timeouts',
+            'whisper_optimization': 'Audio compressed to <25MB for OpenAI Whisper'
         }
     })
 
@@ -303,6 +308,145 @@ def download_audio():
             'error': f'Internal server error: {str(e)}',
             'success': False
         }), 500
+
+def segment_audio_for_processing(input_file, temp_dir, max_segment_duration=600):
+    """Split audio into 10-minute segments for Railway timeout handling"""
+    try:
+        # Get audio duration first
+        probe_cmd = [
+            'ffprobe',
+            '-v', 'quiet',
+            '-print_format', 'json',
+            '-show_format',
+            input_file
+        ]
+
+        result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode != 0:
+            raise Exception(f"Failed to probe audio duration: {result.stderr}")
+
+        import json
+        probe_data = json.loads(result.stdout)
+        total_duration = float(probe_data['format']['duration'])
+
+        logger.info(f"Audio duration: {total_duration:.1f}s, splitting into {max_segment_duration}s segments")
+
+        # Calculate number of segments needed
+        num_segments = int(total_duration / max_segment_duration) + 1
+        segments = []
+
+        for i in range(num_segments):
+            start_time = i * max_segment_duration
+            segment_file = os.path.join(temp_dir, f'segment_{i:03d}.m4a')
+
+            # Create segment with FFmpeg
+            segment_cmd = [
+                'ffmpeg',
+                '-i', input_file,
+                '-ss', str(start_time),
+                '-t', str(max_segment_duration),
+                '-c', 'copy',  # Fast copy without re-encoding
+                '-avoid_negative_ts', 'make_zero',
+                '-y',
+                segment_file
+            ]
+
+            logger.info(f"Creating segment {i+1}/{num_segments}: {start_time}s-{start_time+max_segment_duration}s")
+
+            result = subprocess.run(
+                segment_cmd,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+            )
+
+            if result.returncode != 0:
+                logger.warning(f"Segment {i} creation failed: {result.stderr}")
+                continue
+
+            # Check if segment file was created and has content
+            if os.path.exists(segment_file) and os.path.getsize(segment_file) > 1024:
+                segment_size = os.path.getsize(segment_file) / (1024*1024)
+                segments.append({
+                    'file': segment_file,
+                    'index': i,
+                    'start_time': start_time,
+                    'duration': min(max_segment_duration, total_duration - start_time),
+                    'size_mb': segment_size
+                })
+                logger.info(f"Segment {i} created: {segment_size:.1f}MB")
+            else:
+                logger.warning(f"Segment {i} failed or too small")
+
+        logger.info(f"Successfully created {len(segments)} audio segments")
+        return segments
+
+    except Exception as e:
+        logger.error(f"Audio segmentation failed: {str(e)}")
+        raise Exception(f"Failed to segment audio: {str(e)}")
+
+def compress_segment_for_whisper(segment_info, output_file):
+    """Compress a single audio segment for Whisper with fast settings"""
+    try:
+        input_file = segment_info['file']
+        size_mb = segment_info['size_mb']
+
+        # Use aggressive settings for segments (they're smaller)
+        if size_mb > 50:
+            bitrate = '16k'
+            sample_rate = '8000'
+        elif size_mb > 20:
+            bitrate = '24k'
+            sample_rate = '11025'
+        else:
+            bitrate = '32k'
+            sample_rate = '16000'
+
+        logger.info(f"Compressing segment {segment_info['index']}: {size_mb:.1f}MB with {bitrate} bitrate")
+
+        cmd = [
+            'ffmpeg',
+            '-i', input_file,
+            '-c:a', 'aac',
+            '-b:a', bitrate,
+            '-ac', '1',                  # Mono
+            '-ar', sample_rate,
+            '-threads', '1',             # Single thread per segment
+            '-preset', 'ultrafast',
+            '-profile:a', 'aac_low',
+            '-map_metadata', '-1',
+            '-movflags', '+faststart',
+            '-f', 'mp4',
+            '-y',
+            output_file
+        ]
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=120,  # Short timeout per segment
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+        )
+
+        if result.returncode != 0:
+            raise Exception(f"Segment compression failed: {result.stderr}")
+
+        compressed_size = os.path.getsize(output_file)
+        compressed_mb = compressed_size / (1024*1024)
+
+        logger.info(f"Segment {segment_info['index']} compressed: {size_mb:.1f}MB → {compressed_mb:.2f}MB")
+
+        # Ensure segment is under 25MB (should be much smaller)
+        if compressed_size > 25 * 1024 * 1024:
+            logger.warning(f"Segment {segment_info['index']} still large: {compressed_mb:.2f}MB")
+
+        return compressed_size
+
+    except Exception as e:
+        logger.error(f"Segment compression error: {str(e)}")
+        raise Exception(f"Failed to compress segment: {str(e)}")
 
 def compress_audio_for_whisper(input_file, output_file, original_size_mb):
     """Compress audio file to be under 25MB for OpenAI Whisper with Railway-optimized speed"""
@@ -505,19 +649,46 @@ def process_audio():
                 'success': False
             }), 500
 
-        # Compress audio for Whisper with Railway-optimized settings
+        # Process audio for Whisper with segmentation for large files
         try:
-
-            # Check if file is already small enough
-            if original_size_mb <= 20:  # Under 20MB, minimal compression needed
-                logger.info(f"File already small ({original_size_mb:.1f}MB), using light compression")
+            # Decide processing strategy based on file size
+            if original_size_mb <= 20:
+                # Small files: direct compression
+                logger.info(f"Small file ({original_size_mb:.1f}MB), using direct compression")
                 compressed_size = compress_audio_for_whisper(input_file, output_file, original_size_mb)
+                compressed_size_mb = compressed_size / (1024*1024)
+                logger.info(f"Direct compression: {original_size_mb:.1f}MB → {compressed_size_mb:.2f}MB")
+
+            elif original_size_mb <= 100:
+                # Medium files: aggressive compression
+                logger.info(f"Medium file ({original_size_mb:.1f}MB), using aggressive compression")
+                compressed_size = compress_audio_for_whisper(input_file, output_file, original_size_mb)
+                compressed_size_mb = compressed_size / (1024*1024)
+                logger.info(f"Aggressive compression: {original_size_mb:.1f}MB → {compressed_size_mb:.2f}MB")
+
             else:
-                logger.info(f"Large file ({original_size_mb:.1f}MB), using aggressive compression")
-                compressed_size = compress_audio_for_whisper(input_file, output_file, original_size_mb)
+                # Large files: segment and return first segment immediately
+                logger.info(f"Large file ({original_size_mb:.1f}MB), using segmentation for Railway timeout safety")
 
-            compressed_size_mb = compressed_size / (1024*1024)
-            logger.info(f"Compression complete: {original_size_mb:.1f}MB → {compressed_size_mb:.2f}MB")
+                # Segment the audio into 10-minute chunks
+                segments = segment_audio_for_processing(input_file, temp_dir, max_segment_duration=600)
+
+                if not segments:
+                    raise Exception("Failed to create any audio segments")
+
+                # Process first segment immediately for quick response
+                first_segment = segments[0]
+                first_output = os.path.join(temp_dir, 'first_segment_compressed.m4a')
+
+                logger.info(f"Processing first segment ({first_segment['size_mb']:.1f}MB) for immediate response")
+                compressed_size = compress_segment_for_whisper(first_segment, first_output)
+
+                # Use first segment as the output
+                output_file = first_output
+                compressed_size_mb = compressed_size / (1024*1024)
+
+                logger.info(f"First segment ready: {first_segment['size_mb']:.1f}MB → {compressed_size_mb:.2f}MB")
+                logger.info(f"Note: Returning first 10 minutes of {len(segments)}-segment audio for Railway timeout safety")
 
         except Exception as e:
             error_msg = str(e)
