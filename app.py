@@ -5,6 +5,9 @@ import os
 import logging
 import requests
 import io
+import subprocess
+import tempfile
+import shutil
 from urllib.parse import urlparse
 
 app = Flask(__name__)
@@ -169,7 +172,7 @@ def health_check():
         'endpoints': {
             '/extract': 'Extract audio URL from YouTube video',
             '/download': 'Download audio file server-side and stream to client (bypasses 403 errors)',
-            '/process': 'Complete pipeline: extract + download audio as binary stream (optimized for n8n)'
+            '/process': 'Complete pipeline: extract + compress audio for Whisper (<25MB, 64kbps, mono, 16kHz)'
         }
     })
 
@@ -301,9 +304,66 @@ def download_audio():
             'success': False
         }), 500
 
+def compress_audio_for_whisper(input_file, output_file):
+    """Compress audio file to be under 25MB for OpenAI Whisper"""
+    try:
+        # Whisper-optimized settings: 64kbps bitrate, m4a format
+        cmd = [
+            'ffmpeg',
+            '-i', input_file,
+            '-c:a', 'aac',           # AAC codec for m4a
+            '-b:a', '64k',           # 64kbps bitrate for Whisper
+            '-ac', '1',              # Mono channel (reduces size)
+            '-ar', '16000',          # 16kHz sample rate (Whisper's preference)
+            '-movflags', '+faststart', # Optimize for streaming
+            '-y',                    # Overwrite output file
+            output_file
+        ]
+
+        logger.info(f"Compressing audio with command: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+
+        if result.returncode != 0:
+            raise Exception(f"FFmpeg error: {result.stderr}")
+
+        # Check file size
+        file_size = os.path.getsize(output_file)
+        logger.info(f"Compressed audio file size: {file_size / (1024*1024):.2f} MB")
+
+        if file_size > 24 * 1024 * 1024:  # 24MB to be safe
+            logger.warning(f"File still too large ({file_size / (1024*1024):.2f} MB), trying more aggressive compression")
+
+            # More aggressive compression
+            cmd_aggressive = [
+                'ffmpeg',
+                '-i', input_file,
+                '-c:a', 'aac',
+                '-b:a', '32k',           # Lower bitrate
+                '-ac', '1',              # Mono
+                '-ar', '16000',          # 16kHz
+                '-movflags', '+faststart',
+                '-y',
+                output_file
+            ]
+
+            result = subprocess.run(cmd_aggressive, capture_output=True, text=True, timeout=300)
+            if result.returncode != 0:
+                raise Exception(f"FFmpeg aggressive compression error: {result.stderr}")
+
+            file_size = os.path.getsize(output_file)
+            logger.info(f"Aggressively compressed audio file size: {file_size / (1024*1024):.2f} MB")
+
+        return file_size
+
+    except subprocess.TimeoutExpired:
+        raise Exception("Audio compression timed out")
+    except Exception as e:
+        raise Exception(f"Audio compression failed: {str(e)}")
+
 @app.route('/process', methods=['GET'])
 def process_audio():
-    """Complete pipeline: extract YouTube audio and stream binary directly (optimized for n8n)"""
+    """Complete pipeline: extract YouTube audio, compress for Whisper (<25MB), and stream binary"""
+    temp_dir = None
     try:
         # Get URL parameter
         url = request.args.get('url')
@@ -320,9 +380,9 @@ def process_audio():
                 'success': False
             }), 400
 
-        logger.info(f"Processing audio for URL: {url}")
+        logger.info(f"Processing audio for Whisper optimization: {url}")
 
-        # Extract audio information using optimized format selection
+        # Extract audio information
         try:
             extract_result = extract_audio_info(url, 'm4a')
             if not extract_result.get('success'):
@@ -331,7 +391,7 @@ def process_audio():
             audio_url = extract_result['audio_url']
             title = extract_result.get('title', 'audio')
 
-            logger.info(f"Successfully extracted audio URL, now streaming...")
+            logger.info(f"Successfully extracted audio URL, now downloading and compressing...")
 
         except Exception as e:
             logger.error(f"Failed to extract audio info: {str(e)}")
@@ -340,61 +400,83 @@ def process_audio():
                 'success': False
             }), 500
 
-        # Enhanced headers optimized for YouTube streaming
-        stream_headers = {
-            'User-Agent': 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.210 Mobile Safari/537.36',
-            'Accept': '*/*',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'identity',
-            'Connection': 'keep-alive',
-            'Referer': 'https://www.youtube.com/',
-            'Origin': 'https://www.youtube.com',
-            'Sec-Fetch-Dest': 'video',
-            'Sec-Fetch-Mode': 'no-cors',
-            'Sec-Fetch-Site': 'cross-site',
-            'DNT': '1',
-            'Sec-GPC': '1',
-        }
+        # Create temporary directory for processing
+        temp_dir = tempfile.mkdtemp()
+        input_file = os.path.join(temp_dir, 'input.m4a')
+        output_file = os.path.join(temp_dir, 'output.m4a')
 
-        # Stream the audio with optimized chunking
-        def generate_audio_stream():
-            try:
-                logger.info(f"Starting audio stream from: {audio_url[:100]}...")
-                with requests.get(
-                    audio_url,
-                    headers=stream_headers,
-                    stream=True,
-                    timeout=60,
-                    verify=True
-                ) as response:
-                    response.raise_for_status()
+        # Download audio file
+        try:
+            logger.info(f"Downloading audio from: {audio_url[:100]}...")
 
-                    # Log successful connection
-                    content_length = response.headers.get('content-length', 'unknown')
-                    logger.info(f"Connected to audio stream. Content-Length: {content_length}")
+            download_headers = {
+                'User-Agent': 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.210 Mobile Safari/537.36',
+                'Accept': '*/*',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Connection': 'keep-alive',
+                'Referer': 'https://www.youtube.com/',
+                'Origin': 'https://www.youtube.com',
+            }
 
-                    # Stream in optimized chunks
-                    chunk_size = 16384  # 16KB chunks for better performance
-                    bytes_streamed = 0
+            with requests.get(audio_url, headers=download_headers, stream=True, timeout=120) as response:
+                response.raise_for_status()
 
-                    for chunk in response.iter_content(chunk_size=chunk_size):
+                original_size = 0
+                with open(input_file, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
                         if chunk:
-                            bytes_streamed += len(chunk)
-                            yield chunk
+                            f.write(chunk)
+                            original_size += len(chunk)
 
-                    logger.info(f"Successfully streamed {bytes_streamed} bytes")
+                logger.info(f"Downloaded {original_size / (1024*1024):.2f} MB original audio")
 
-            except requests.exceptions.RequestException as e:
-                logger.error(f"Request error during streaming: {str(e)}")
-                yield b''  # End stream gracefully
+        except Exception as e:
+            logger.error(f"Failed to download audio: {str(e)}")
+            return jsonify({
+                'error': f'Failed to download audio: {str(e)}',
+                'success': False
+            }), 500
+
+        # Compress audio for Whisper
+        try:
+            compressed_size = compress_audio_for_whisper(input_file, output_file)
+
+            if compressed_size > 25 * 1024 * 1024:
+                return jsonify({
+                    'error': f'Audio file too large for Whisper: {compressed_size / (1024*1024):.2f} MB (max 25MB)',
+                    'success': False
+                }), 413
+
+            logger.info(f"Successfully compressed audio to {compressed_size / (1024*1024):.2f} MB for Whisper")
+
+        except Exception as e:
+            logger.error(f"Failed to compress audio: {str(e)}")
+            return jsonify({
+                'error': f'Failed to compress audio: {str(e)}',
+                'success': False
+            }), 500
+
+        # Stream the compressed audio file
+        def generate_compressed_stream():
+            try:
+                with open(output_file, 'rb') as f:
+                    while True:
+                        chunk = f.read(16384)  # 16KB chunks
+                        if not chunk:
+                            break
+                        yield chunk
             except Exception as e:
-                logger.error(f"Unexpected error during streaming: {str(e)}")
-                yield b''  # End stream gracefully
+                logger.error(f"Error streaming compressed audio: {str(e)}")
+                yield b''
+            finally:
+                # Cleanup temp directory
+                if temp_dir and os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir)
 
-        # Create optimized streaming response
+        # Create response with Whisper-optimized audio
         response = Response(
-            stream_with_context(generate_audio_stream()),
-            content_type='audio/mp4',  # Standard MIME type for m4a
+            stream_with_context(generate_compressed_stream()),
+            content_type='audio/mp4',
             headers={
                 'Cache-Control': 'no-cache, no-store, must-revalidate',
                 'Pragma': 'no-cache',
@@ -403,6 +485,9 @@ def process_audio():
                 'Access-Control-Allow-Origin': '*',
                 'Access-Control-Allow-Methods': 'GET',
                 'Access-Control-Allow-Headers': 'Content-Type',
+                'X-Audio-Compression': 'whisper-optimized',
+                'X-Audio-Bitrate': '64kbps',
+                'X-Audio-Format': 'm4a-mono-16khz',
             }
         )
 
@@ -410,6 +495,9 @@ def process_audio():
 
     except Exception as e:
         logger.error(f"Unexpected error in /process endpoint: {str(e)}")
+        # Cleanup on error
+        if temp_dir and os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
         return jsonify({
             'error': f'Internal server error: {str(e)}',
             'success': False
